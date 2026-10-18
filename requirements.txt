@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_session
+from app.models import Book, Loan, Member
+from app.schemas import LoanCreate, LoanRead
+
+router = APIRouter()
+
+
+@router.post("/borrow", response_model=LoanRead, status_code=status.HTTP_201_CREATED)
+async def borrow_book(payload: LoanCreate, session: AsyncSession = Depends(get_session)) -> Loan:
+    book = await session.get(Book, payload.book_id)
+    if book is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Book not found")
+
+    member = await session.get(Member, payload.member_id)
+    if member is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found")
+
+    if book.copies_available <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No copies available for borrowing")
+
+    loan = Loan(
+        book_id=payload.book_id,
+        member_id=payload.member_id,
+        due_date=payload.due_date,
+        status="borrowed",
+    )
+    book.copies_available -= 1
+    session.add(loan)
+    await session.commit()
+    await session.refresh(loan)
+    return loan
+
+
+@router.post("/{loan_id}/return", response_model=LoanRead)
+async def return_book(loan_id: int, session: AsyncSession = Depends(get_session)) -> Loan:
+    loan = await session.get(Loan, loan_id)
+    if loan is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Loan not found")
+
+    if loan.returned_at is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Book already returned")
+
+    loan.returned_at = datetime.utcnow()
+    loan.status = "returned"
+
+    book = await session.get(Book, loan.book_id)
+    if book is not None:
+        book.copies_available += 1
+
+    await session.commit()
+    await session.refresh(loan)
+    return loan
+
+
+@router.get("", response_model=list[LoanRead])
+async def list_loans(session: AsyncSession = Depends(get_session)) -> list[Loan]:
+    result = await session.execute(select(Loan).order_by(Loan.issued_at.desc()))
+    return result.scalars().all()
